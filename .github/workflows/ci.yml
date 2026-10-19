@@ -52,7 +52,7 @@ jobs:
           chmod -R a+w "$PWD"
           docker run --rm --network host -v "$PWD:/zap/wrk:rw" \
             ghcr.io/zaproxy/zaproxy:stable \
-            zap-baseline.py -t http://localhost:3000 -c .zap/rules.tsv -r zap-report.html
+            zap-baseline.py -t http://localhost:3000 -c .zap/rules.tsv -r zap-report.html -I
       - uses: actions/upload-artifact@v4
         if: always()
         with:
