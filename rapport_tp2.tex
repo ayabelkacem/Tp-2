@@ -1,0 +1,324 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[french]{babel}
+\usepackage{lmodern}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{graphicx}
+\usepackage{float}
+
+\geometry{margin=2.5cm}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+
+\definecolor{codegray}{RGB}{245,245,245}
+\definecolor{codegreen}{RGB}{35,110,55}
+\definecolor{codeblue}{RGB}{25,70,145}
+
+\lstset{
+  backgroundcolor=\color{codegray},
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codeblue}\bfseries,
+  commentstyle=\color{codegreen},
+  stringstyle=\color{red!65!black},
+  breaklines=true,
+  frame=single,
+  showstringspaces=false,
+  columns=fullflexible
+}
+
+\title{\textbf{TP 2 -- Intégration de la sécurité\ dans un pipeline CI/CD}}
+\author{Étudiant : \rule{7cm}{0.4pt}}
+\date{19 octobre 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+Ce travail pratique a pour objectif d'intégrer des contrôles de sécurité automatisés
+dans un pipeline d'intégration continue. L'idée principale est de transformer le
+pipeline CI/CD en garde-fou : une modification ne doit pas être considérée comme
+acceptable si elle introduit une vulnérabilité détectable par les outils de sécurité.
+
+Le projet utilisé est une petite application Flask exposée sur le port 3000. Le dépôt
+GitHub utilisé est :
+\begin{center}
+\url{https://github.com/ayabelkacem/Tp-2}
+\end{center}
+
+Les contrôles intégrés sont les suivants :
+\begin{itemize}
+  \item tests unitaires avec pytest ;
+  \item SAST avec Bandit ;
+  \item SCA avec Trivy ;
+  \item DAST avec OWASP ZAP dans un conteneur Docker temporaire.
+\end{itemize}
+
+\section{Application et structure du projet}
+
+L'application retourne le texte \texttt{Hello} sur la route principale. Une route
+\texttt{/ping} est également présente dans la version corrigée. Elle valide le nom
+d'hôte fourni par l'utilisateur avant d'appeler la commande système \texttt{ping}.
+
+Les principaux fichiers du projet sont :
+\begin{table}[H]
+\centering
+\begin{tabular}{p{4cm}p{9cm}}
+\toprule
+\textbf{Fichier} & \textbf{Rôle} \\
+\midrule
+\texttt{app.py} & Application Flask et routes HTTP. \\
+\texttt{test\_app.py} & Test de la route principale. \\
+\texttt{requirements.txt} & Versions de Flask et pytest. \\
+\texttt{Dockerfile} & Image Docker de l'application. \\
+\texttt{.github/workflows/ci.yml} & Pipeline GitHub Actions. \\
+\texttt{.zap/rules.tsv} & Règles de sévérité utilisées par OWASP ZAP. \\
+\bottomrule
+\end{tabular}
+\caption{Structure fonctionnelle du projet}
+\end{table}
+
+Le fichier \texttt{requirements.txt} contient les dépendances principales :
+\begin{lstlisting}[language={},caption={Dépendances Python}]
+Flask==3.0.3
+pytest==8.3.3
+\end{lstlisting}
+
+\section{Pipeline CI/CD de base}
+
+Le pipeline est déclenché dans deux cas : lors d'un \textit{push} sur \texttt{main}
+et lors de la création ou de la mise à jour d'une pull request vers \texttt{main}.
+
+Le premier job, nommé \texttt{build-test}, utilise Ubuntu et Python 3.12. Il installe
+les dépendances puis exécute pytest :
+\begin{lstlisting}[language={},caption={Job de compilation logique et de tests}]
+build-test:
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - run: pip install -r requirements.txt
+    - run: pytest
+\end{lstlisting}
+
+Le test réalisé vérifie que la route \texttt{/} retourne le statut HTTP 200. Ce job
+constitue la première barrière du pipeline : les analyses de sécurité ne démarrent
+qu'après la réussite des tests.
+
+\section{Intégration du SAST avec Bandit}
+
+Le SAST analyse le code source sans exécuter l'application. Bandit est installé dans
+le job \texttt{sast}, puis lancé avec :
+\begin{lstlisting}[language=bash]
+bandit -r . -lll
+\end{lstlisting}
+
+L'option \texttt{-lll} demande à Bandit de considérer les problèmes de niveau élevé
+comme bloquants. Le job dépend de \texttt{build-test} grâce à la directive :
+\begin{lstlisting}[language={}]
+needs: build-test
+\end{lstlisting}
+
+\subsection{Démonstration de l'échec}
+
+Une branche \texttt{feat/vuln-demo} a été créée avec une route volontairement
+vulnérable :
+\begin{lstlisting}[language=Python]
+import subprocess
+from flask import request
+
+@app.route("/ping")
+def ping():
+    host = request.args.get("host")
+    return subprocess.check_output("ping -c 1 " + host, shell=True)
+\end{lstlisting}
+
+Cette implémentation concatène directement une entrée utilisateur dans une commande
+exécutée par un shell. Elle permet une injection de commandes système. Bandit détecte
+le problème \texttt{B602} et signale une sévérité \textbf{High} à cause de
+\texttt{shell=True}.
+
+La pull request correspondante est la PR \#1 :
+\begin{center}
+\url{https://github.com/ayabelkacem/Tp-2/pull/1}
+\end{center}
+
+Résultat observé : \texttt{build-test} réussit, mais \texttt{sast} échoue. Cette
+branche démontre que le pipeline identifie et bloque une vulnérabilité de code.
+
+\section{Intégration du SCA avec Trivy}
+
+Le SCA analyse les dépendances et le système de fichiers à la recherche de
+vulnérabilités connues. Le job Trivy utilise les paramètres suivants :
+\begin{lstlisting}[language={}]
+scan-type: fs
+scanners: vuln
+severity: HIGH,CRITICAL
+ignore-unfixed: true
+exit-code: "1"
+\end{lstlisting}
+
+La combinaison de \texttt{severity: HIGH,CRITICAL} et de \texttt{exit-code: "1"}
+rend le job bloquant lorsqu'une vulnérabilité haute ou critique corrigible est
+détectée. Les vulnérabilités sans correctif sont ignorées grâce à
+\texttt{ignore-unfixed: true}.
+
+\section{Analyse dynamique avec OWASP ZAP}
+
+Le DAST teste l'application en fonctionnement. Le job \texttt{dast} dépend de la
+réussite de SAST et de SCA :
+\begin{lstlisting}[language={}]
+needs: [sast, sca]
+\end{lstlisting}
+
+L'environnement est éphémère. Le pipeline construit l'image Docker, démarre un
+conteneur nommé \texttt{app}, attend que l'URL soit disponible, puis lance ZAP :
+\begin{lstlisting}[language=bash]
+docker build -t app-under-test .
+docker run -d --name app -p 3000:3000 app-under-test
+curl -sf http://localhost:3000
+
+docker run --rm --network host \\
+  -v "$PWD:/zap/wrk:rw" \\
+  ghcr.io/zaproxy/zaproxy:stable \\
+  zap-baseline.py -t http://localhost:3000 \\
+  -c .zap/rules.tsv -r zap-report.html -I
+\end{lstlisting}
+
+Le rapport HTML est téléversé comme artefact même en cas d'échec. Le conteneur est
+également supprimé avec \texttt{if: always()} afin d'éviter de laisser un service
+actif sur le runner.
+
+\subsection{Règles ZAP}
+
+Le fichier \texttt{.zap/rules.tsv} utilise de vraies tabulations entre les colonnes :
+\begin{lstlisting}[language={}]
+40012    FAIL    (Cross Site Scripting - Reflected)
+40018    FAIL    (SQL Injection)
+90020    FAIL    (Remote OS Command Injection)
+10038    WARN    (Content Security Policy Header Not Set)
+\end{lstlisting}
+
+Les règles XSS, SQL Injection et Remote OS Command Injection sont bloquantes. La
+règle CSP est un avertissement. L'option ZAP \texttt{-I} permet de ne pas bloquer le
+pipeline pour les avertissements, tout en conservant le blocage des alertes
+classées \texttt{FAIL}. Le rapport ZAP reste disponible comme artefact GitHub Actions.
+
+\section{Correction de la vulnérabilité}
+
+La branche \texttt{fix/vuln-demo} remplace l'exécution shell par une validation stricte
+et une liste d'arguments :
+\begin{lstlisting}[language=Python]
+import re
+import subprocess
+from flask import request
+
+@app.route("/ping")
+def ping():
+    host = request.args.get("host", "")
+    if not re.fullmatch(r"[A-Za-z0-9.\-]{1,253}", host):
+        return "Invalid host", 400
+    result = subprocess.run(
+        ["ping", "-c", "1", host],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout
+\end{lstlisting}
+
+La validation limite l'entrée à des caractères alphanumériques, aux points et au
+tiret, avec une longueur maximale de 253 caractères. Surtout, la commande n'est plus
+interprétée par un shell : l'option \texttt{shell=True} a disparu.
+
+La pull request de correction est la PR \#2 :
+\begin{center}
+\url{https://github.com/ayabelkacem/Tp-2/pull/2}
+\end{center}
+
+Les résultats finaux de la PR corrigée sont :
+\begin{itemize}
+  \item \texttt{build-test} : succès ;
+  \item \texttt{sast} : succès ;
+  \item \texttt{sca} : succès ;
+  \item \texttt{dast} : succès.
+\end{itemize}
+
+\section{Synthèse des résultats}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{p{3cm}p{3.1cm}p{3.1cm}p{4.2cm}}
+\toprule
+\textbf{Contrôle} & \textbf{PR vulnérable} & \textbf{PR corrigée} & \textbf{Interprétation} \\
+\midrule
+Build et tests & Succès & Succès & Le projet se construit et les tests passent. \\
+SAST Bandit & Échec & Succès & L'injection shell est détectée puis supprimée. \\
+SCA Trivy & Succès & Succès & Les dépendances ne présentent pas de blocage HIGH/CRITICAL. \\
+DAST ZAP & Neutre & Succès & Le scan dynamique est exécuté après SAST et SCA. \\
+\bottomrule
+\end{tabular}
+\caption{Comparaison des deux pull requests}
+\end{table}
+
+\section{Protection de la branche principale}
+
+Pour que le pipeline soit réellement un garde-fou lors d'une fusion, les règles GitHub
+suivantes doivent être activées pour la branche \texttt{main} :
+\begin{enumerate}
+  \item ouvrir \textit{Settings} puis \textit{Branches} ;
+  \item créer une règle pour le motif \texttt{main} ;
+  \item activer \textit{Require a pull request before merging} ;
+  \item activer \textit{Require status checks to pass before merging} ;
+  \item rendre obligatoires les contrôles \texttt{build-test}, \texttt{sast},
+        \texttt{sca} et \texttt{dast}.
+\end{enumerate}
+
+Cette configuration est importante : sans elle, un utilisateur disposant des droits
+appropriés pourrait fusionner une branche malgré un pipeline rouge.
+
+\section{Captures d'écran}
+
+Les captures suivantes peuvent être insérées dans cette section. Il faut remplacer les
+noms de fichiers par les captures réellement exportées depuis GitHub :
+
+\begin{figure}[H]
+\centering
+\IfFileExists{capture-pr-vulnerable.png}{%
+  \includegraphics[width=0.95\textwidth]{capture-pr-vulnerable.png}%
+}{\fbox{\parbox{0.85\textwidth}{\centering Capture à insérer : PR \#1 avec le job SAST en échec.}}}
+\caption{Échec du pipeline sur la pull request vulnérable}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\IfFileExists{capture-pr-corrigee.png}{%
+  \includegraphics[width=0.95\textwidth]{capture-pr-corrigee.png}%
+}{\fbox{\parbox{0.85\textwidth}{\centering Capture à insérer : PR \#2 avec les quatre jobs au vert.}}}
+\caption{Succès du pipeline sur la pull request corrigée}
+\end{figure}
+
+\section{Conclusion}
+
+Le TP a permis de mettre en place une chaîne de contrôles de sécurité dans GitHub
+Actions. Le pipeline vérifie d'abord le fonctionnement de l'application, puis analyse
+le code avec Bandit, les dépendances avec Trivy et l'application en fonctionnement avec
+OWASP ZAP.
+
+La démonstration est complète : une vulnérabilité volontaire provoque l'échec du SAST,
+puis la correction de cette vulnérabilité permet à la pull request de passer les quatre
+contrôles. La dernière étape nécessaire pour imposer ce comportement à toute l'équipe
+est l'activation effective de la protection de la branche \texttt{main} dans les
+paramètres GitHub.
+
+\end{document}
