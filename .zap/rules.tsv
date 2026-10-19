@@ -1,0 +1,4 @@
+40012	FAIL	(Cross Site Scripting - Reflected)
+40018	FAIL	(SQL Injection)
+90020	FAIL	(Remote OS Command Injection)
+10038	WARN	(Content Security Policy Header Not Set)
